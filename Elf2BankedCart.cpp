@@ -1,4 +1,4 @@
-// Elf2BankedCart.cpp
+// Elf2BankedCart.cpp - builds clean in Linux as well.
 // 
 // This takes a program compiled for the TI-99/4A using Gcc-9900 and creates a bank-switched cartridge
 // image. It has several requirements. The first is the standard crt0.s which needs to be provided,
@@ -28,15 +28,19 @@
 // Either way, the name is searched for and specifies only the order of the output ROM. The actual banking
 // is handled in your code however you need it to be handled.
 // 
-// Currently I don't know whether I will still strict the fixed area to 16k or allow 24k, allow compression on it,
-// or whether to have a cartridge header in every bank like I prefer (that'll depend on when I get this working,
-// whether every page has the 32 bytes necessary. That will also require the linker/makefile to leave room!)
-// I also haven't worked out how to use the .data section yet.. though it looks like it's just a memory dump.
+// The first 44 bytes of every page are reserved for the standard header. This gives you room for your cartridge
+// header, some generic padding, and the first instruction to reset the page (such as CLR @>6000). This ensures
+// that no matter what page your cart boots up on, it can start successfully. Your program must take this space
+// into account and store nothing there!
+// 
+// Currently I don't know whether I will still restrict the fixed area to 16k or allow 24k, allow compression on it.
 // That will also require crt0 support
 //
 
 #include <stdio.h>
 #include <string.h>
+
+#define CART_HEADER_SIZE 46
 
 // well, hell. A stock TI cart can do 32MB. A gigacart can do 8GB. We'll stick to 32MB for now.
 unsigned char buf[32*1024*1024];
@@ -44,6 +48,7 @@ unsigned char elf[33*1024*1024];    // allow an extra meg of overhead ;)
 int used[4096];                     // 4096 pages in 32MB
 int load[4096];                     // linked address for each page (just to double check)
 char name[4096][256];               // list of names
+unsigned char carthdr[CART_HEADER_SIZE];
 
 FILE *fp;
 int outpos;
@@ -52,6 +57,11 @@ int sectsiz;
 int sectcnt;
 int sectnam;
 int sectnamoff;
+
+// initialized in copysection, using globals as a lazy return
+int virt;
+int data;
+int datsiz;
 
 bool copysection(int bankidx, const char *str, int maxsiz = 8192, bool mute = false) {
     // find section 'str' in the ELF file, and copy its data to the buffer at outpos
@@ -65,14 +75,17 @@ bool copysection(int bankidx, const char *str, int maxsiz = 8192, bool mute = fa
         //printf(".. try '%s' (0x%X)\n", &elf[nam], nam);
         if (0 == strcmp((const char*)(&elf[nam]), str)) {
             // found it!
-            int virt = (elf[off+0xc]<<24)|(elf[off+0xd]<<16)|(elf[off+0xe]<<8)|(elf[off+0xf]);      // load address, 0xa000 or 0x6000 expected
-            int data = (elf[off+0x10]<<24)|(elf[off+0x11]<<16)|(elf[off+0x12]<<8)|(elf[off+0x13]);  // where is the data
-            int datsiz = (elf[off+0x14]<<24)|(elf[off+0x15]<<16)|(elf[off+0x16]<<8)|(elf[off+0x17]);    // how big
+            virt = (elf[off+0xc]<<24)|(elf[off+0xd]<<16)|(elf[off+0xe]<<8)|(elf[off+0xf]);      // load address, 0xa000 or 0x6000 expected
+            data = (elf[off+0x10]<<24)|(elf[off+0x11]<<16)|(elf[off+0x12]<<8)|(elf[off+0x13]);  // where is the data
+            datsiz = (elf[off+0x14]<<24)|(elf[off+0x15]<<16)|(elf[off+0x16]<<8)|(elf[off+0x17]);    // how big
 
             printf("Loading section '%s' address 0x%04X size %d\n", str, virt, datsiz);
-            load[bankidx] = virt;
-            used[bankidx] = datsiz;
-            strcpy(name[bankidx], str);
+            used[bankidx] += datsiz;
+            // don't copy data if first char is '.' (so .data doesn't overwrite loader)
+            if (*str != '.') {
+                strcpy(name[bankidx], str);
+                load[bankidx] = virt;
+            }
 
             if (datsiz > maxsiz) {
                 printf("Data larger than %d bytes - image is invalid\n", maxsiz);
@@ -94,10 +107,15 @@ void padto(int x) {
     int slack = outpos%x;
     if (slack) {
         int cnt = x-slack;
-        printf("Adding %d bytes of padding...\n", cnt);
+        //printf("Adding %d bytes of padding...\n", cnt);
         memset(&buf[outpos], 0xff, cnt);
         outpos += cnt;
     }
+    
+    // now that we are padded, leave room for the cart header
+    // this means the one bank of fixed loader won't have a cart header, but the CRT0 will ensure
+    // we don't spend much time there, and it's very unlikely to come up at random.
+    outpos += CART_HEADER_SIZE;
 }
 
 int main(int argc, char *argv[]) {
@@ -165,25 +183,42 @@ int main(int argc, char *argv[]) {
     sectnamoff = (elf[sectnamoff+0x10]<<24)|(elf[sectnamoff+0x11]<<16)|(elf[sectnamoff+0x12]<<8)|(elf[sectnamoff+0x13]);
     printf("Sector name offset at 0x%x\n", sectnamoff);
 
+    // before we do anything too fancy, we locate the .bss section to copy it's data for the crt0 later
     outpos = 0;
+    copysection(0, ".bss", 32*1024, true);
+    int bsspos = virt;
+    int bsssiz = datsiz;
+
+    // then we reset output
+    outpos = 0;
+    used[0]=0;
     if (!copysection(0, "loader")) {
         return 1;
     }
 
-    int datapos = outpos;       // TODO: patch the crt with the data information
-    if (!copysection(1, ".data")) { // just using 1 as a dummy, will overwrite it
+    int datapos = outpos;
+    if (!copysection(0, ".data")) {     // add to 0 size
         return 1;
     }
+    int dataram = virt;
+    // the data section MUST be an even size
+    if (outpos&1) {
+        buf[outpos++]=0xff;
+    }
 
-    int fixedpos = outpos;      // TODO: patch the crt with the fixed information
-    if (!copysection(1, "fixed", 16384)) { // reusing 1 again cause we don't store .data
+    int fixedpos = outpos;
+    if (!copysection(1, "fixed", 16384)) {
         return 1;
     }
 
     // fixed area free space
-    used[0] = outpos;
+    int totalsize = used[0]+used[1];
+    used[0] = totalsize;
     if (used[0] > 8192) used[0]=8192;
-    used[1] = outpos-8192;
+    used[1] = totalsize-used[0];
+    // now fudge the sizes cause these two pages don't have the header reserve
+    used[0]-=CART_HEADER_SIZE;
+    used[1]-=CART_HEADER_SIZE;
 
     if (outpos > 16384) {
         printf("Loader/data/fixed is greater than 16k! Cart is not valid.\n");
@@ -223,7 +258,41 @@ int main(int argc, char *argv[]) {
         ++bank;
     }
 
+    // ignore the last cart header padding - assumes at least one padto!
+    outpos -= CART_HEADER_SIZE;
+
     printf("Got cart size of %dk\n", outpos/1024);
+
+    // fill in the C startup data in the cart header
+    // this'll confuse people ;)
+    // Actual header as we use it:
+
+    // 0xAA01 - header byte and version
+    // Address of initialized data in RAM
+    // Address of initialized data in ROM
+    // Program List (as normal)
+    // Size of initialized data
+    // BSS start in RAM
+    // Size of BSS (if odd, be aware an extra byte is cleared)
+    // Start address of fixed program in ROM bank 0
+    
+    //f[0]=0xaa
+    //f[1]=0x01
+    buf[2]=(dataram>>8)&0xff;
+    buf[3]=(dataram)&0xff;
+    buf[4]=(datapos>>8)&0xff;
+    buf[5]=(datapos)&0xff;
+    //f[6]=program list msb
+    //f[7]=program list lsb
+    buf[8]=((fixedpos-datapos)>>8)&0xff;
+    buf[9]=((fixedpos-datapos))&0xff;
+    buf[10]=(bsspos>>8)&0xff;
+    buf[11]=(bsspos)&0xff;
+    buf[12]=(bsssiz>>8)&0xff;
+    buf[13]=(bsssiz)&0xff;
+    fixedpos += 0x6000;     // make a cartridge address
+    buf[14]=(fixedpos>>8)&0xff;
+    buf[15]=(fixedpos)&0xff;
 
     // now see where we ended up, and pad to a power of 2
     // TODO: cart headers would go here too
@@ -235,6 +304,8 @@ int main(int argc, char *argv[]) {
         if (outpos < validsize) {
             printf("Padding to %dk\n", validsize/1024);
             padto(validsize);
+            // ignore the last cart header padding (again)
+            outpos -= CART_HEADER_SIZE;
             break;
         }
         validsize*=2;
@@ -245,12 +316,16 @@ int main(int argc, char *argv[]) {
     }
 
     // dump the banking map - we'll just use the size again
+    // while we're in there, we'll copy the cart header everywhere but the loader/fixed pages
     validsize = 8192;
     bank = 0;
-    printf("##  ADDR  NAME         LOAD  FREE\n");
-    printf("--  ----  -----------  ----  -----\n");
+    printf("##  BANK  ROM     NAME         LOAD  FREE\n");
+    printf("--  ----  ------  -----------  ----  -----\n");
     while (outpos >= validsize) {
-        printf("%02d  %04X  %-11s  %04X  %5d\n", bank, 0x6000+bank*2, name[bank], load[bank], 8192-used[bank]);
+        printf("%02d  %04X  %06X  %-11s  %04X  %5d\n", bank, 0x6000+bank*2, 8192*bank, name[bank], load[bank], 8192-used[bank]-CART_HEADER_SIZE);
+        if (bank > 1) {
+            memcpy(&buf[bank*8192], buf, CART_HEADER_SIZE);
+        }
         ++bank;
         validsize+=8192;
     }
