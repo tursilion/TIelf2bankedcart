@@ -17,7 +17,7 @@
 // 
 // or
 // 
-// bank1a
+// bank1a (this is used by loader, so do not define it)
 // bank1b
 // bank2a
 // bank2b
@@ -33,8 +33,7 @@
 // that no matter what page your cart boots up on, it can start successfully. Your program must take this space
 // into account and store nothing there!
 // 
-// Currently I don't know whether I will still restrict the fixed area to 16k or allow 24k, allow compression on it.
-// That will also require crt0 support
+// 24k startup it shall be!
 //
 
 #include <stdio.h>
@@ -207,7 +206,7 @@ int main(int argc, char *argv[]) {
     }
 
     int fixedpos = outpos;
-    if (!copysection(1, "fixed", 16384)) {
+    if (!copysection(1, "fixed", 8192*3)) {     // up to 24k - though not all usable because of the above sections
         return 1;
     }
 
@@ -216,37 +215,56 @@ int main(int argc, char *argv[]) {
     used[0] = totalsize;
     if (used[0] > 8192) used[0]=8192;
     used[1] = totalsize-used[0];
-    // now fudge the sizes cause these two pages don't have the header reserve
+    if (used[1] > 8192) used[1]=8192;
+    used[2] = totalsize-used[0]-used[1];
+    // now fudge the sizes cause these pages don't have the header reserve
     used[0]-=CART_HEADER_SIZE;
     used[1]-=CART_HEADER_SIZE;
+    used[2]-=CART_HEADER_SIZE;
 
-    if (outpos > 16384) {
-        printf("Loader/data/fixed is greater than 16k! Cart is not valid.\n");
+    if (outpos > 3*8192) {
+        printf("Loader/data/fixed is greater than 24k! Cart is not valid.\n");
         // but keep going so we can see everything
         // truncate before we pad so that the rest builds correctly
-        outpos = 16384;
+        outpos = 3*8192;
     }
 
-    padto(16384);               // pad the initial bit to 16k
+    padto(3*8192);               // pad the initial bit to 24k
 
     // now parse and load any banks we may have
-    // TODO: cart headers would go here
     int bank = 1;
-    int usedbank = 2;
+    int usedbank = 3;
+    bool first = true;
     for (;;) {
         char buf[128];
-        sprintf(buf, "bank%da", bank);
-        if (copysection(usedbank, buf, 8192, true)) {
-            padto(8192);
-            usedbank++;
+        bool found = false;
+        if (first) {
+            first = false;
+            // we need to only check b, not a, cause a got used by the loader
             sprintf(buf, "bank%db", bank);
-            if (!copysection(usedbank, buf)) {
-                printf("Warning: bank A without matching bank B may throw off indexing\n");
-            } else {
+            if (copysection(usedbank, buf)) {
+                found = true;
                 padto(8192);
                 usedbank++;
             }
         } else {
+            sprintf(buf, "bank%da", bank);
+            if (copysection(usedbank, buf, 8192, true)) {
+                found = true;
+                padto(8192);
+                usedbank++;
+                sprintf(buf, "bank%db", bank);
+                if (!copysection(usedbank, buf)) {
+                    printf("Warning: bank A without matching bank B may throw off indexing\n");
+                } else {
+                    padto(8192);
+                    usedbank++;
+                }
+            }
+        }
+
+        // if not bankNa/b, try just bankN
+        if (!found) {
             sprintf(buf, "bank%d", bank);
             if (!copysection(usedbank, buf)) {
                 // must be done
@@ -323,7 +341,8 @@ int main(int argc, char *argv[]) {
     printf("--  ----  ------  -----------  ----  -----\n");
     while (outpos >= validsize) {
         printf("%02d  %04X  %06X  %-11s  %04X  %5d\n", bank, 0x6000+bank*2, 8192*bank, name[bank], load[bank], 8192-used[bank]-CART_HEADER_SIZE);
-        if (bank > 1) {
+        if (bank > 2) {
+            // bank >2 for 24k fixed
             memcpy(&buf[bank*8192], buf, CART_HEADER_SIZE);
         }
         ++bank;
